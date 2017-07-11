@@ -43,6 +43,10 @@ D3D12_VERTEX_BUFFER_VIEW vertexBufferView_;
 ComPtr<ID3D12Resource> indexBuffer_;
 D3D12_INDEX_BUFFER_VIEW indexBufferView_;
 
+ComPtr<ID3D12Resource> depthStencilBuffer_[framebufferCount_];
+ComPtr<ID3D12DescriptorHeap> dsvDescriptorHeap_;
+uint32_t dsHandleSize_;
+
 int frameIdx_;
 unsigned int rtvHandleSize_;
 
@@ -253,6 +257,8 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
     psoDesc.SampleDesc = sampleDesc;
     psoDesc.SampleMask = 0xffffffff;
     psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+    psoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+    psoDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
     psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
     psoDesc.NumRenderTargets = 1;
 
@@ -265,6 +271,11 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
         { {  0.5f, -0.5f, 0.5f }, { 0.0f, 1.0f, 0.0f, 1.0f } },
         { { -0.5f, -0.5f, 0.5f }, { 0.0f, 0.0f, 1.0f, 1.0f } },
         { {  0.5f,  0.5f, 0.5f }, { 1.0f, 0.0f, 0.0f, 1.0f } },
+
+        { { -0.75f,  0.75f,  0.7f }, { 0.0f, 1.0f, 0.0f, 1.0f } },
+        { { 0.0f,  0.0f, 0.7f } , { 0.0f, 1.0f, 0.0f, 1.0f } },
+        { { -0.75f,  0.0f, 0.7f } , { 0.0f, 1.0f, 0.0f, 1.0f } },
+        { { 0.0f,  0.75f,  0.7f } , { 0.0f, 1.0f, 0.0f, 1.0f } },
     };
     uint32_t vertBufSize = sizeof(vertices);
 
@@ -375,6 +386,46 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
     scissors_.bottom = height;
     scissors_.right = width;
 
+    D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = {};
+    dsvHeapDesc.NumDescriptors = framebufferCount_;
+    dsvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    dsvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    result = device_->CreateDescriptorHeap(&dsvHeapDesc, IID_PPV_ARGS(dsvDescriptorHeap_.GetAddressOf()));
+    if (FAILED(result))
+        return false;
+    dsvDescriptorHeap_->SetName(L"DepthStencilDescriptorHeap");
+
+    dsHandleSize_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+
+    D3D12_DEPTH_STENCIL_VIEW_DESC depthStencilDesc = {};
+    depthStencilDesc.Format = DXGI_FORMAT_D32_FLOAT;
+    depthStencilDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    depthStencilDesc.Flags = D3D12_DSV_FLAG_NONE;
+
+    D3D12_CLEAR_VALUE depthClearValue = {};
+    depthClearValue.Format = DXGI_FORMAT_D32_FLOAT;
+    depthClearValue.DepthStencil.Depth = 1.0f;
+    depthClearValue.DepthStencil.Stencil = 0;
+
+    const auto dsvHeapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+    const auto dsvTexDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_D32_FLOAT, width, height, 1, 0, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    CD3DX12_CPU_DESCRIPTOR_HANDLE dsvHandle { dsvDescriptorHeap_->GetCPUDescriptorHandleForHeapStart() };
+
+    for (int i = 0; i < framebufferCount_; ++i) {
+        result = device_->CreateCommittedResource(
+            &dsvHeapProps,
+            D3D12_HEAP_FLAG_NONE,
+            &dsvTexDesc,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE,
+            &depthClearValue,
+            IID_PPV_ARGS(depthStencilBuffer_[i].GetAddressOf()));
+        if (FAILED(result))
+            return false;
+
+        device_->CreateDepthStencilView(depthStencilBuffer_[i].Get(), &depthStencilDesc, dsvHandle);
+        dsvHandle.Offset(1, dsHandleSize_);
+    }
+
     return true;
 }
 
@@ -440,11 +491,13 @@ void updatePipeline()
     commandList_->ResourceBarrier(1, &presentToRenderTarget);
 
     CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle{ rtvDescriptorHeap_->GetCPUDescriptorHandleForHeapStart(), frameIdx_, rtvHandleSize_ };
+    CD3DX12_CPU_DESCRIPTOR_HANDLE dsvHandle{ dsvDescriptorHeap_->GetCPUDescriptorHandleForHeapStart(), frameIdx_, dsHandleSize_ };
 
-    commandList_->OMSetRenderTargets(1, &rtvHandle, false, nullptr);
+    commandList_->OMSetRenderTargets(1, &rtvHandle, false, &dsvHandle);
 
     const float clearColor[] = { 0.0f, 0.2f, 0.4f, 1.0f };
     commandList_->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+    commandList_->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
     commandList_->SetGraphicsRootSignature(rootSignature_.Get());
     commandList_->RSSetViewports(1, &viewport_);
@@ -453,6 +506,7 @@ void updatePipeline()
     commandList_->IASetVertexBuffers(0, 1, &vertexBufferView_);
     commandList_->IASetIndexBuffer(&indexBufferView_);
     commandList_->DrawIndexedInstanced(6, 1, 0, 0, 0);
+    commandList_->DrawIndexedInstanced(6, 1, 0, 4, 0);
 
     commandList_->ResourceBarrier(1, &renderTargetToPresent);
 
