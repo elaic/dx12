@@ -40,6 +40,8 @@ D3D12_VIEWPORT viewport_;
 D3D12_RECT scissors_;
 ComPtr<ID3D12Resource> vertexBuffer_;
 D3D12_VERTEX_BUFFER_VIEW vertexBufferView_;
+ComPtr<ID3D12Resource> indexBuffer_;
+D3D12_INDEX_BUFFER_VIEW indexBufferView_;
 
 int frameIdx_;
 unsigned int rtvHandleSize_;
@@ -259,20 +261,26 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
         return false;
 
     Vertex vertices[] = {
-        { { 0.0f, 0.5f, 0.5f }, { 1.0f, 0.0f, 0.0f, 1.0f } },
-        { { 0.5f, -0.5f, 0.5f }, { 0.0f, 1.0f, 0.0f, 1.0f } },
+        { { -0.5f,  0.5f, 0.5f }, { 1.0f, 0.0f, 0.0f, 1.0f } },
+        { {  0.5f, -0.5f, 0.5f }, { 0.0f, 1.0f, 0.0f, 1.0f } },
         { { -0.5f, -0.5f, 0.5f }, { 0.0f, 0.0f, 1.0f, 1.0f } },
+        { {  0.5f,  0.5f, 0.5f }, { 1.0f, 0.0f, 0.0f, 1.0f } },
     };
+    uint32_t vertBufSize = sizeof(vertices);
 
-    UINT vertBufSize = sizeof(vertices);
+    uint32_t indices[] = {
+        0, 1, 2,
+        0, 3, 1
+    };
+    uint32_t indexBufSize = sizeof(indices);
 
     const auto defaultHeapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
-    const auto vertBudderDesc = CD3DX12_RESOURCE_DESC::Buffer(vertBufSize);
+    const auto vertBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(vertBufSize);
 
     result = device_->CreateCommittedResource(
         &defaultHeapProps,
         D3D12_HEAP_FLAG_NONE,
-        &vertBudderDesc,
+        &vertBufferDesc,
         D3D12_RESOURCE_STATE_COPY_DEST,
         nullptr,
         IID_PPV_ARGS(vertexBuffer_.GetAddressOf()));
@@ -286,7 +294,7 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
     result = device_->CreateCommittedResource(
         &uploadHeapProps,
         D3D12_HEAP_FLAG_NONE,
-        &vertBudderDesc,
+        &vertBufferDesc,
         D3D12_RESOURCE_STATE_GENERIC_READ,
         nullptr,
         IID_PPV_ARGS(vertBufferUploadRes.GetAddressOf()));
@@ -294,15 +302,48 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
         return false;
     vertBufferUploadRes->SetName(L"VertexBufferUploadResource");
 
+    const auto indexBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(indexBufSize);
+
+    result = device_->CreateCommittedResource(
+        &defaultHeapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &indexBufferDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr,
+        IID_PPV_ARGS(indexBuffer_.GetAddressOf()));
+    if (FAILED(result))
+        return false;
+    indexBuffer_->SetName(L"IndexBufferResource");
+
+    ComPtr<ID3D12Resource> indexBufferUploadRes;
+    result = device_->CreateCommittedResource(
+        &uploadHeapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &vertBufferDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(indexBufferUploadRes.GetAddressOf()));
+    if (FAILED(result))
+        return false;
+    indexBufferUploadRes->SetName(L"IndexBufferUploadResource");
+
     D3D12_SUBRESOURCE_DATA vertexData = {};
     vertexData.pData = reinterpret_cast<BYTE*>(vertices);
     vertexData.RowPitch = vertBufSize;
     vertexData.SlicePitch = vertBufSize;
 
-    const auto transition = CD3DX12_RESOURCE_BARRIER::Transition(vertexBuffer_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+    D3D12_SUBRESOURCE_DATA indexData = {};
+    indexData.pData = reinterpret_cast<BYTE*>(indices);
+    indexData.RowPitch = indexBufSize;
+    indexData.SlicePitch = indexBufSize;
+
+    const auto vertexTransition = CD3DX12_RESOURCE_BARRIER::Transition(vertexBuffer_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+    const auto indexTransition = CD3DX12_RESOURCE_BARRIER::Transition(indexBuffer_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
 
     UpdateSubresources(commandList_.Get(), vertexBuffer_.Get(), vertBufferUploadRes.Get(), 0, 0, 1, &vertexData);
-    commandList_->ResourceBarrier(1, &transition);
+    commandList_->ResourceBarrier(1, &vertexTransition);
+    UpdateSubresources(commandList_.Get(), indexBuffer_.Get(), indexBufferUploadRes.Get(), 0, 0, 1, &indexData);
+    commandList_->ResourceBarrier(1, &indexTransition);
     commandList_->Close();
     ID3D12CommandList* cmdLists[] = { commandList_.Get() };
     commandQueue_->ExecuteCommandLists(1, cmdLists);
@@ -317,6 +358,10 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
     vertexBufferView_.BufferLocation = vertexBuffer_->GetGPUVirtualAddress();
     vertexBufferView_.SizeInBytes = vertBufSize;
     vertexBufferView_.StrideInBytes = sizeof(Vertex);
+
+    indexBufferView_.BufferLocation = indexBuffer_->GetGPUVirtualAddress();
+    indexBufferView_.SizeInBytes = indexBufSize;
+    indexBufferView_.Format = DXGI_FORMAT_R32_UINT;
 
     viewport_.TopLeftX = 0;
     viewport_.TopLeftY = 0;
@@ -406,7 +451,8 @@ void updatePipeline()
     commandList_->RSSetScissorRects(1, &scissors_);
     commandList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     commandList_->IASetVertexBuffers(0, 1, &vertexBufferView_);
-    commandList_->DrawInstanced(3, 1, 0, 0);
+    commandList_->IASetIndexBuffer(&indexBufferView_);
+    commandList_->DrawIndexedInstanced(6, 1, 0, 0, 0);
 
     commandList_->ResourceBarrier(1, &renderTargetToPresent);
 
