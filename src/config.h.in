@@ -1,0 +1,6 @@
+#if !defined(DX12_CONFIG_H)
+#define DX12_CONFIG_H
+
+#define PROJECT_SRC_DIR "${PROJECT_SRC}"
+
+#endif // DX12_CONFIG_H

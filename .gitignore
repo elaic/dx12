@@ -33,3 +33,7 @@
 *.app
 
 build/
+x64/
+
+# this file is auto-generated
+src/config.h

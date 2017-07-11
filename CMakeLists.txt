@@ -25,13 +25,18 @@ find_library(D3DCOMPILER_LIB d3dcompiler "C:/Program Files (x86)/Windows Kits/10
 
 set(MAIN_DIR ${PROJECT_SOURCE_DIR}/src)
 set(MAIN_SRCS
-	${MAIN_DIR}/d3xd12.h
+	${MAIN_DIR}/d3dx12.h
 	${MAIN_DIR}/dx.h
 	${MAIN_DIR}/dx.cpp
 	${MAIN_DIR}/main.cpp
 )
 
-include_directories(${MAIN_DIR})
+set(PROJECT_SRC ${PROJECT_SOURCE_DIR})
+configure_file(${MAIN_DIR}/config.h.in ${MAIN_DIR}/config.h)
+
+include_directories(${MAIN_DIR}
+	${PROJECT_SOURCE_DIR}/external/directxmath/Inc
+)
 
 # ###
 # # DEPENDENCIES

@@ -1,13 +1,20 @@
 #include "dx.h"
 
+#include "config.h"
+
 #pragma warning(push)
 #pragma warning(disable : 4324)
 #include "d3dx12.h"
 #pragma warning(pop)
 
+#include "DirectXMath.h"
+
 #include <cstdint>
+#include <cstdio>
+#include <string>
 
 #include <d3d12.h>
+#include <d3dcompiler.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 
@@ -27,13 +34,28 @@ ComPtr<ID3D12Fence> fences_[framebufferCount_];
 uint64_t fenceValues_[framebufferCount_];
 HANDLE fenceEvent_;
 
+ComPtr<ID3D12PipelineState> pipelineState_;
+ComPtr<ID3D12RootSignature> rootSignature_;
+D3D12_VIEWPORT viewport_;
+D3D12_RECT scissors_;
+ComPtr<ID3D12Resource> vertexBuffer_;
+D3D12_VERTEX_BUFFER_VIEW vertexBufferView_;
+
 int frameIdx_;
 unsigned int rtvHandleSize_;
+
+const std::string projectRoot_(PROJECT_SRC_DIR);
+const std::wstring wprojectRoot_(projectRoot_.begin(), projectRoot_.end());
 
 static void updatePipeline();
 static void waitForPreviousFrame(bool isShutdown = false);
 
 OnErrorCallback errorCallback_;
+
+struct Vertex
+{
+    DirectX::XMFLOAT3 pos;
+};
 
 bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallback errorCallback)
 {
@@ -41,17 +63,17 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
 
     errorCallback_ = errorCallback;
 
-    IDXGIFactory4* dxgiFactory;
-    result = CreateDXGIFactory1(IID_PPV_ARGS(&dxgiFactory));
+    ComPtr<IDXGIFactory4> dxgiFactory;
+    result = CreateDXGIFactory1(IID_PPV_ARGS(dxgiFactory.GetAddressOf()));
     if (FAILED(result)) {
         return false;
     }
 
-    IDXGIAdapter1* adapter;
+    ComPtr<IDXGIAdapter1> adapter;
     int adapterIdx = 0;
     bool adapterFound = false;
 
-    while (dxgiFactory->EnumAdapters1(adapterIdx, &adapter) != DXGI_ERROR_NOT_FOUND) {
+    while (dxgiFactory->EnumAdapters1(adapterIdx, adapter.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND) {
         DXGI_ADAPTER_DESC1 desc;
         adapter->GetDesc1(&desc);
 
@@ -60,7 +82,7 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
             continue;
         }
 
-        result = D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), NULL);
+        result = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), NULL);
         if (SUCCEEDED(result)) {
             adapterFound = true;
             break;
@@ -72,7 +94,7 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
     if (!adapterFound)
         return false;
 
-    result = D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(device_.GetAddressOf()));
+    result = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(device_.GetAddressOf()));
     if (FAILED(result))
         return false;
 
@@ -98,10 +120,12 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
     swapChainDesc.SampleDesc = sampleDesc;
     swapChainDesc.Windowed = !fullscreen;
 
-    IDXGISwapChain* tmpSwapChain;
-    dxgiFactory->CreateSwapChain(commandQueue_.Get(), &swapChainDesc, &tmpSwapChain);
+    ComPtr<IDXGISwapChain> tmpSwapChain;
+    dxgiFactory->CreateSwapChain(commandQueue_.Get(), &swapChainDesc, tmpSwapChain.GetAddressOf());
 
-    *swapChain_.GetAddressOf() = static_cast<IDXGISwapChain3*>(tmpSwapChain);
+    result = tmpSwapChain.As(&swapChain_);
+    if (FAILED(result))
+        return false;
 
     frameIdx_ = swapChain_->GetCurrentBackBufferIndex();
 
@@ -136,7 +160,6 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
     result = device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocators_[0].Get(), nullptr, IID_PPV_ARGS(commandList_.GetAddressOf()));
     if (FAILED(result))
         return false;
-    commandList_->Close();
 
     for (int i = 0; i < framebufferCount_; ++i) {
         result = device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fences_[i].GetAddressOf()));
@@ -148,6 +171,162 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
     fenceEvent_ = CreateEvent(nullptr, FALSE, FALSE, nullptr);
     if (!fenceEvent_)
         return false;
+
+    CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc;
+    rootSigDesc.Init(0, nullptr, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+
+    ComPtr<ID3DBlob> rootSig;
+    ComPtr<ID3DBlob> errorBlob;
+    result = D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1, &rootSig, errorBlob.GetAddressOf());
+    if (FAILED(result)) {
+        if (errorBlob) {
+            printf("%s\n", (char*)errorBlob->GetBufferPointer());
+        }
+        return false;
+    }
+
+    result = device_->CreateRootSignature(0, rootSig->GetBufferPointer(), rootSig->GetBufferSize(), IID_PPV_ARGS(rootSignature_.GetAddressOf()));
+    if (FAILED(result))
+        return false;
+
+    ComPtr<ID3DBlob> vertexShader;
+    result = D3DCompileFromFile(
+        (wprojectRoot_ + std::wstring(L"/shaders/vertex.hlsl")).c_str(),
+        nullptr,
+        nullptr,
+        "main",
+        "vs_5_0",
+        D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION,
+        0,
+        &vertexShader,
+        errorBlob.ReleaseAndGetAddressOf());
+    if (FAILED(result)) {
+        if (errorBlob)
+            OutputDebugStringA((char*)errorBlob->GetBufferPointer());
+        return false;
+    }
+
+    D3D12_SHADER_BYTECODE vertexBytecode;
+    vertexBytecode.pShaderBytecode = vertexShader->GetBufferPointer();
+    vertexBytecode.BytecodeLength = vertexShader->GetBufferSize();
+
+    ComPtr<ID3DBlob> pixelShader;
+    result = D3DCompileFromFile(
+        (wprojectRoot_ + std::wstring(L"/shaders/pixel.hlsl")).c_str(),
+        nullptr,
+        nullptr,
+        "main",
+        "ps_5_0",
+        D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION,
+        0,
+        pixelShader.GetAddressOf(),
+        errorBlob.ReleaseAndGetAddressOf());
+    if (FAILED(result)) {
+        if (errorBlob)
+            OutputDebugStringA((char*)errorBlob->GetBufferPointer());
+        return false;
+    }
+
+    D3D12_SHADER_BYTECODE pixelBytecode;
+    pixelBytecode.pShaderBytecode = pixelShader->GetBufferPointer();
+    pixelBytecode.BytecodeLength = pixelShader->GetBufferSize();
+
+    D3D12_INPUT_ELEMENT_DESC inputLayout[] =
+    {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+    };
+    D3D12_INPUT_LAYOUT_DESC layoutDesc = {};
+    layoutDesc.NumElements = sizeof(inputLayout) / sizeof(inputLayout[0]);
+    layoutDesc.pInputElementDescs = inputLayout;
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
+    psoDesc.InputLayout = layoutDesc;
+    psoDesc.pRootSignature = rootSignature_.Get();
+    psoDesc.VS = vertexBytecode;
+    psoDesc.PS = pixelBytecode;
+    psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    psoDesc.SampleDesc = sampleDesc;
+    psoDesc.SampleMask = 0xffffffff;
+    psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+    psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+    psoDesc.NumRenderTargets = 1;
+
+    result = device_->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(pipelineState_.GetAddressOf()));
+    if (FAILED(result))
+        return false;
+
+    Vertex vertices[] = {
+        { { 0.0f, 0.5f, 0.5f } },
+        { { 0.5f, -0.5f, 0.5f } },
+        { { -0.5f, -0.5f, 0.5f } },
+    };
+
+    UINT vertBufSize = sizeof(vertices);
+
+    const auto defaultHeapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+    const auto vertBudderDesc = CD3DX12_RESOURCE_DESC::Buffer(vertBufSize);
+
+    result = device_->CreateCommittedResource(
+        &defaultHeapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &vertBudderDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr,
+        IID_PPV_ARGS(vertexBuffer_.GetAddressOf()));
+    if (FAILED(result))
+        return false;
+    vertexBuffer_->SetName(L"VertexBufferResource");
+
+    const auto uploadHeapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+
+    ComPtr<ID3D12Resource> vertBufferUploadRes;
+    result = device_->CreateCommittedResource(
+        &uploadHeapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &vertBudderDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(vertBufferUploadRes.GetAddressOf()));
+    if (FAILED(result))
+        return false;
+    vertBufferUploadRes->SetName(L"VertexBufferUploadResource");
+
+    D3D12_SUBRESOURCE_DATA vertexData = {};
+    vertexData.pData = reinterpret_cast<BYTE*>(vertices);
+    vertexData.RowPitch = vertBufSize;
+    vertexData.SlicePitch = vertBufSize;
+
+    const auto transition = CD3DX12_RESOURCE_BARRIER::Transition(vertexBuffer_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+
+    UpdateSubresources(commandList_.Get(), vertexBuffer_.Get(), vertBufferUploadRes.Get(), 0, 0, 1, &vertexData);
+    commandList_->ResourceBarrier(1, &transition);
+    commandList_->Close();
+    ID3D12CommandList* cmdLists[] = { commandList_.Get() };
+    commandQueue_->ExecuteCommandLists(1, cmdLists);
+
+    result = commandQueue_->Signal(fences_[frameIdx_].Get(), fenceValues_[frameIdx_]);
+    if (FAILED(result))
+        return false;
+    waitForPreviousFrame();
+    // TODO: super ugly hack!!! Rework wait for previous frame!
+    fenceValues_[frameIdx_]--;
+
+    vertexBufferView_.BufferLocation = vertexBuffer_->GetGPUVirtualAddress();
+    vertexBufferView_.SizeInBytes = vertBufSize;
+    vertexBufferView_.StrideInBytes = sizeof(Vertex);
+
+    viewport_.TopLeftX = 0;
+    viewport_.TopLeftY = 0;
+    viewport_.Width = (float)width;
+    viewport_.Height = (float)height;
+    viewport_.MinDepth = 0.0f;
+    viewport_.MaxDepth = 1.0f;
+
+    scissors_.top = 0;
+    scissors_.left = 0;
+    scissors_.bottom = height;
+    scissors_.right = width;
 
     return true;
 }
@@ -204,7 +383,7 @@ void updatePipeline()
     if (FAILED(result))
         errorCallback_();
 
-    result = commandList_->Reset(commandAllocators_[frameIdx_].Get(), nullptr);
+    result = commandList_->Reset(commandAllocators_[frameIdx_].Get(), pipelineState_.Get());
     if (FAILED(result))
         errorCallback_();
 
@@ -219,6 +398,13 @@ void updatePipeline()
 
     const float clearColor[] = { 0.0f, 0.2f, 0.4f, 1.0f };
     commandList_->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+
+    commandList_->SetGraphicsRootSignature(rootSignature_.Get());
+    commandList_->RSSetViewports(1, &viewport_);
+    commandList_->RSSetScissorRects(1, &scissors_);
+    commandList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    commandList_->IASetVertexBuffers(0, 1, &vertexBufferView_);
+    commandList_->DrawInstanced(3, 1, 0, 0);
 
     commandList_->ResourceBarrier(1, &renderTargetToPresent);
 
