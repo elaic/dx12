@@ -18,6 +18,27 @@
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 
+struct Vertex
+{
+    DirectX::XMFLOAT3 pos;
+    DirectX::XMFLOAT4 color;
+
+    static const D3D12_INPUT_ELEMENT_DESC inputLayout[];
+    static const size_t inputLayoutSize;
+};
+
+const D3D12_INPUT_ELEMENT_DESC Vertex::inputLayout[] =
+{
+    { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+    { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+};
+
+const size_t Vertex::inputLayoutSize = sizeof(Vertex::inputLayout) / sizeof(Vertex::inputLayout[0]);
+
+struct ConstantBuffer
+{
+    DirectX::XMFLOAT4 colorMultiplier;
+};
 
 using Microsoft::WRL::ComPtr;
 
@@ -58,6 +79,11 @@ ComPtr<ID3D12Resource> depthStencilBuffer_[framebufferCount_];
 ComPtr<ID3D12DescriptorHeap> dsvDescriptorHeap_;
 uint32_t dsHandleSize_;
 
+// Constant buffer variables;
+ComPtr<ID3D12DescriptorHeap> mainDescriptorHeap_[framebufferCount_];
+ComPtr<ID3D12Resource> constBuffer[framebufferCount_];
+ConstantBuffer cbuf;
+
 int frameIdx_;
 
 OnErrorCallback errorCallback_;
@@ -78,31 +104,10 @@ static bool createRTVDescHeap();
 static bool createDSVDescHeap(int width, int height);
 static bool createCommandResources();
 static bool createRootSignature();
+static bool createMainDescHeap();
 static bool compileShader(const std::wstring& name, const char* shaderType, ID3DBlob** outShaderBytecode);
 static bool createPSO(ID3DBlob* vertexShader, ID3DBlob* pixelShader);
 static bool setupGeometry();
-
-struct Vertex
-{
-    DirectX::XMFLOAT3 pos;
-    DirectX::XMFLOAT4 color;
-
-    static const D3D12_INPUT_ELEMENT_DESC inputLayout[];
-    static const size_t inputLayoutSize;
-};
-
-const D3D12_INPUT_ELEMENT_DESC Vertex::inputLayout[] =
-{
-    { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-    { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-};
-
-const size_t Vertex::inputLayoutSize = sizeof(Vertex::inputLayout) / sizeof(Vertex::inputLayout[0]);
-
-struct ConstantBuffer
-{
-    DirectX::XMFLOAT4 colorMultiplier;
-};
 
 bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallback errorCallback)
 {
@@ -124,6 +129,9 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
         return false;
 
     if (!createDSVDescHeap(width, height))
+        return false;
+
+    if (!createMainDescHeap())
         return false;
 
     if (!createCommandResources())
@@ -163,7 +171,38 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
 
 void update()
 {
+    // update app logic, such as moving the camera or figuring out what objects are in view
+    static float rIncrement = 0.00002f;
+    static float gIncrement = 0.00006f;
+    static float bIncrement = 0.00009f;
 
+    cbuf.colorMultiplier.x += rIncrement;
+    cbuf.colorMultiplier.y += gIncrement;
+    cbuf.colorMultiplier.z += bIncrement;
+
+    if (cbuf.colorMultiplier.x >= 1.0f || cbuf.colorMultiplier.x <= 0.0f) {
+        cbuf.colorMultiplier.x = cbuf.colorMultiplier.x >= 1.0f ? 1.0f : 0.0f;
+        rIncrement = -rIncrement;
+    }
+
+    if (cbuf.colorMultiplier.y >= 1.0f || cbuf.colorMultiplier.y <= 0.0f) {
+        cbuf.colorMultiplier.y = cbuf.colorMultiplier.y >= 1.0f ? 1.0f : 0.0f;
+        gIncrement = -gIncrement;
+    }
+
+    if (cbuf.colorMultiplier.z >= 1.0f || cbuf.colorMultiplier.z <= 0.0f) {
+        cbuf.colorMultiplier.z = cbuf.colorMultiplier.z >= 1.0f ? 1.0f : 0.0f;
+        bIncrement = -bIncrement;
+    }
+
+    // map and copy constant buffer
+    CD3DX12_RANGE readRange{ 0, 0 };
+    CD3DX12_RANGE writeRange{ 0, sizeof(cbuf) };
+    ConstantBuffer* cbufGpuAddr;
+
+    constBuffer[frameIdx_]->Map(0, &readRange, reinterpret_cast<void**>(&cbufGpuAddr));
+    memcpy(cbufGpuAddr, &cbuf, sizeof(cbuf));
+    constBuffer[frameIdx_]->Unmap(0, &readRange);
 }
 
 void render()
@@ -231,7 +270,11 @@ static void updatePipeline()
     commandList_->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
     commandList_->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
-    //commandList_->SetGraphicsRootSignature(rootSignature_.Get());
+    ID3D12DescriptorHeap* descHeaps[] = { mainDescriptorHeap_[frameIdx_].Get() };
+    commandList_->SetDescriptorHeaps(sizeof(descHeaps) / sizeof(descHeaps[0]), descHeaps);
+
+    commandList_->SetGraphicsRootSignature(rootSignature_.Get());
+    commandList_->SetGraphicsRootDescriptorTable(0, mainDescriptorHeap_[frameIdx_]->GetGPUDescriptorHandleForHeapStart());
     commandList_->RSSetViewports(1, &viewport_);
     commandList_->RSSetScissorRects(1, &scissors_);
     commandList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -429,6 +472,55 @@ static bool createDSVDescHeap(int width, int height)
     return true;
 }
 
+static bool createMainDescHeap()
+{
+    HRESULT result;
+
+    const auto uploadHeapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+    const auto bufferProps = CD3DX12_RESOURCE_DESC::Buffer(1024 * 64);
+
+    memset(&cbuf, 0, sizeof(cbuf));
+
+    for (int i = 0; i < framebufferCount_; ++i) {
+        D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+        heapDesc.NumDescriptors = 1;
+        heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+
+        result = device_->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(mainDescriptorHeap_[i].GetAddressOf()));
+
+        if (FAILED(result))
+            return false;
+
+        result = device_->CreateCommittedResource(
+            &uploadHeapProps,
+            D3D12_HEAP_FLAG_NONE,
+            &bufferProps,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr,
+            IID_PPV_ARGS(constBuffer[i].GetAddressOf()));
+
+        if (FAILED(result))
+            return false;
+        constBuffer[i]->SetName(L"ConstantBufferHeap");
+
+        D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
+        cbvDesc.BufferLocation = constBuffer[i]->GetGPUVirtualAddress();
+        cbvDesc.SizeInBytes = (sizeof(ConstantBuffer) + 255) & ~255;
+
+        device_->CreateConstantBufferView(&cbvDesc, mainDescriptorHeap_[i]->GetCPUDescriptorHandleForHeapStart());
+
+        CD3DX12_RANGE readRange{ 0, 0 };
+        CD3DX12_RANGE writeRange{ 0, sizeof(cbuf) };
+        ConstantBuffer* cbufGpuAddr;
+        constBuffer[i]->Map(0, &readRange, reinterpret_cast<void**>(&cbufGpuAddr));
+        memcpy(cbufGpuAddr, &cbuf, sizeof(cbuf));
+        constBuffer[i]->Unmap(0, &readRange);
+    }
+
+    return true;
+}
+
 static bool createCommandResources()
 {
     HRESULT result;
@@ -468,8 +560,33 @@ static bool createCommandResources()
 
 static bool createRootSignature()
 {
+    D3D12_DESCRIPTOR_RANGE descriptorRanges[1] = {};
+    descriptorRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
+    descriptorRanges[0].NumDescriptors = 1;
+    descriptorRanges[0].BaseShaderRegister = 0;
+    descriptorRanges[0].RegisterSpace = 0;
+    descriptorRanges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_ROOT_DESCRIPTOR_TABLE descriptorTable = {};
+    descriptorTable.NumDescriptorRanges = sizeof(descriptorRanges) / sizeof(descriptorRanges[0]);
+    descriptorTable.pDescriptorRanges = descriptorRanges;
+
+    D3D12_ROOT_PARAMETER rootParams[1] = {};
+    rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rootParams[0].DescriptorTable = descriptorTable;
+    rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+
     CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc;
-    rootSigDesc.Init(0, nullptr, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+    rootSigDesc.Init(
+        sizeof(rootParams) / sizeof(rootParams[0]),
+        rootParams,
+        0,
+        nullptr,
+        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
+        D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
+        D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
+        D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS |
+        D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS);
 
     ComPtr<ID3DBlob> rootSig;
     ComPtr<ID3DBlob> errorBlob;
