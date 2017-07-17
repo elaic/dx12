@@ -86,6 +86,22 @@ struct Vertex
 {
     DirectX::XMFLOAT3 pos;
     DirectX::XMFLOAT4 color;
+
+    static const D3D12_INPUT_ELEMENT_DESC inputLayout[];
+    static const size_t inputLayoutSize;
+};
+
+const D3D12_INPUT_ELEMENT_DESC Vertex::inputLayout[] =
+{
+    { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+    { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+};
+
+const size_t Vertex::inputLayoutSize = sizeof(Vertex::inputLayout) / sizeof(Vertex::inputLayout[0]);
+
+struct ConstantBuffer
+{
+    DirectX::XMFLOAT4 colorMultiplier;
 };
 
 bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallback errorCallback)
@@ -507,14 +523,9 @@ static bool createPSO(ID3DBlob* vertexShader, ID3DBlob* pixelShader)
     pixelBytecode.BytecodeLength = pixelShader->GetBufferSize();
 
     // would be nice to have just one of these for all assets
-    static const D3D12_INPUT_ELEMENT_DESC inputLayout[] =
-    {
-        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-        { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-    };
     D3D12_INPUT_LAYOUT_DESC layoutDesc = {};
-    layoutDesc.NumElements = sizeof(inputLayout) / sizeof(inputLayout[0]);
-    layoutDesc.pInputElementDescs = inputLayout;
+    layoutDesc.NumElements = Vertex::inputLayoutSize;
+    layoutDesc.pInputElementDescs = Vertex::inputLayout;
 
     // There should be only 1 sample desc structure, the same for pso and rt
     DXGI_SAMPLE_DESC sampleDesc = {};
