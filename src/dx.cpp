@@ -50,6 +50,7 @@ ComPtr<ID3D12Device> device_;
 ComPtr<IDXGISwapChain3> swapChain_;
 D3D12_VIEWPORT viewport_;
 D3D12_RECT scissors_;
+ComPtr<ID3D12Debug> debugController_;
 
 // command resources
 ComPtr<ID3D12CommandQueue> commandQueue_;
@@ -324,6 +325,11 @@ static bool createDevice()
     HRESULT result;
     int adapterIdx = 0;
     bool adapterFound = false;
+
+    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(debugController_.GetAddressOf()))))
+    {
+        debugController_->EnableDebugLayer();
+    }
 
     while (dxgiFactory_->EnumAdapters1(adapterIdx, adapter.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND) {
         DXGI_ADAPTER_DESC1 desc;
