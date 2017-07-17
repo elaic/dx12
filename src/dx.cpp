@@ -23,40 +23,64 @@ using Microsoft::WRL::ComPtr;
 
 constexpr int framebufferCount_ = 3;
 
+// general device/present variables
+ComPtr<IDXGIFactory4> dxgiFactory_;
 ComPtr<ID3D12Device> device_;
 ComPtr<IDXGISwapChain3> swapChain_;
+D3D12_VIEWPORT viewport_;
+D3D12_RECT scissors_;
+
+// command resources
 ComPtr<ID3D12CommandQueue> commandQueue_;
-ComPtr<ID3D12DescriptorHeap> rtvDescriptorHeap_;
-ComPtr<ID3D12Resource> renderTargets_[framebufferCount_];
 ComPtr<ID3D12CommandAllocator> commandAllocators_[framebufferCount_];
 ComPtr<ID3D12GraphicsCommandList> commandList_;
 ComPtr<ID3D12Fence> fences_[framebufferCount_];
 uint64_t fenceValues_[framebufferCount_];
 HANDLE fenceEvent_;
 
+// graphics pipeline state config
 ComPtr<ID3D12PipelineState> pipelineState_;
 ComPtr<ID3D12RootSignature> rootSignature_;
-D3D12_VIEWPORT viewport_;
-D3D12_RECT scissors_;
+
+// vertex/index buffer resources
 ComPtr<ID3D12Resource> vertexBuffer_;
-D3D12_VERTEX_BUFFER_VIEW vertexBufferView_;
 ComPtr<ID3D12Resource> indexBuffer_;
+D3D12_VERTEX_BUFFER_VIEW vertexBufferView_;
 D3D12_INDEX_BUFFER_VIEW indexBufferView_;
 
+// Render target variables
+ComPtr<ID3D12DescriptorHeap> rtvDescriptorHeap_;
+ComPtr<ID3D12Resource> renderTargets_[framebufferCount_];
+uint32_t rtvHandleSize_;
+
+// Depth stencil variables
 ComPtr<ID3D12Resource> depthStencilBuffer_[framebufferCount_];
 ComPtr<ID3D12DescriptorHeap> dsvDescriptorHeap_;
 uint32_t dsHandleSize_;
 
 int frameIdx_;
-unsigned int rtvHandleSize_;
 
-const std::string projectRoot_(PROJECT_SRC_DIR);
-const std::wstring wprojectRoot_(projectRoot_.begin(), projectRoot_.end());
+OnErrorCallback errorCallback_;
 
+// useful variables for resource path
+static const std::string projectRoot_(PROJECT_SRC_DIR);
+static const std::wstring wprojectRoot_(projectRoot_.begin(), projectRoot_.end());
+
+// static (private) functions
 static void updatePipeline();
 static void waitForPreviousFrame(bool isShutdown = false);
 
-OnErrorCallback errorCallback_;
+static bool createDxgiFactory();
+static bool createDevice();
+static bool createSwapChain(HWND window, int width, int height, bool fullscreen);
+static bool createCommandQueue();
+static bool createRTVDescHeap();
+static bool createDSVDescHeap(int width, int height);
+static bool createCommandResources();
+static bool createRootSignature();
+static bool compileShader(const std::wstring& name, const char* shaderType, ID3DBlob** outShaderBytecode);
+static bool createPSO(ID3DBlob* vertexShader, ID3DBlob* pixelShader);
+static bool setupGeometry();
 
 struct Vertex
 {
@@ -66,21 +90,183 @@ struct Vertex
 
 bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallback errorCallback)
 {
-    HRESULT result;
-
     errorCallback_ = errorCallback;
 
-    ComPtr<IDXGIFactory4> dxgiFactory;
-    result = CreateDXGIFactory1(IID_PPV_ARGS(dxgiFactory.GetAddressOf()));
-    if (FAILED(result)) {
+    if (!createDxgiFactory())
         return false;
+
+    if (!createDevice())
+        return false;
+
+    if (!createCommandQueue())
+        return false;
+
+    if (!createSwapChain(window, width, height, fullscreen))
+        return false;
+
+    if (!createRTVDescHeap())
+        return false;
+
+    if (!createDSVDescHeap(width, height))
+        return false;
+
+    if (!createCommandResources())
+        return false;
+
+    if (!createRootSignature())
+        return false;
+
+    ComPtr<ID3DBlob> vertexShader;
+    if (!compileShader(std::wstring(L"vertex.hlsl"), "vs_5_0", vertexShader.GetAddressOf()))
+        return false;
+
+    ComPtr<ID3DBlob> pixelShader;
+    if (!compileShader(std::wstring(L"pixel.hlsl"), "ps_5_0", pixelShader.GetAddressOf()))
+        return false;
+
+    if (!createPSO(vertexShader.Get(), pixelShader.Get()))
+        return false;
+
+    if (!setupGeometry())
+        return false;
+
+    viewport_.TopLeftX = 0;
+    viewport_.TopLeftY = 0;
+    viewport_.Width = (float)width;
+    viewport_.Height = (float)height;
+    viewport_.MinDepth = 0.0f;
+    viewport_.MaxDepth = 1.0f;
+
+    scissors_.top = 0;
+    scissors_.left = 0;
+    scissors_.bottom = height;
+    scissors_.right = width;
+
+    return true;
+}
+
+void update()
+{
+
+}
+
+void render()
+{
+    HRESULT result;
+
+    updatePipeline();
+
+    ID3D12CommandList* commandLists[] = { commandList_.Get() };
+
+    commandQueue_->ExecuteCommandLists(1, commandLists);
+
+    result = commandQueue_->Signal(fences_[frameIdx_].Get(), fenceValues_[frameIdx_]);
+    if (FAILED(result))
+        errorCallback_();
+
+    result = swapChain_->Present(0, 0);
+    if (FAILED(result))
+        errorCallback_();
+}
+
+void cleanupd3d()
+{
+    for (int i = 0; i < framebufferCount_; ++i) {
+        frameIdx_ = i;
+        waitForPreviousFrame(true);
     }
 
+    BOOL fullscreen = false;
+    HRESULT result = swapChain_->GetFullscreenState(&fullscreen, NULL);
+    if (FAILED(result))
+        errorCallback_();
+
+    if (fullscreen)
+        swapChain_->SetFullscreenState(false, NULL);
+
+    CloseHandle(fenceEvent_);
+}
+
+static void updatePipeline()
+{
+    HRESULT result;
+
+    waitForPreviousFrame();
+
+    result = commandAllocators_[frameIdx_]->Reset();
+    if (FAILED(result))
+        errorCallback_();
+
+    result = commandList_->Reset(commandAllocators_[frameIdx_].Get(), pipelineState_.Get());
+    if (FAILED(result))
+        errorCallback_();
+
+    const auto presentToRenderTarget = CD3DX12_RESOURCE_BARRIER::Transition(renderTargets_[frameIdx_].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const auto renderTargetToPresent = CD3DX12_RESOURCE_BARRIER::Transition(renderTargets_[frameIdx_].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+
+    commandList_->ResourceBarrier(1, &presentToRenderTarget);
+
+    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle{ rtvDescriptorHeap_->GetCPUDescriptorHandleForHeapStart(), frameIdx_, rtvHandleSize_ };
+    CD3DX12_CPU_DESCRIPTOR_HANDLE dsvHandle{ dsvDescriptorHeap_->GetCPUDescriptorHandleForHeapStart(), frameIdx_, dsHandleSize_ };
+
+    commandList_->OMSetRenderTargets(1, &rtvHandle, false, &dsvHandle);
+
+    const float clearColor[] = { 0.0f, 0.2f, 0.4f, 1.0f };
+    commandList_->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+    commandList_->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+
+    //commandList_->SetGraphicsRootSignature(rootSignature_.Get());
+    commandList_->RSSetViewports(1, &viewport_);
+    commandList_->RSSetScissorRects(1, &scissors_);
+    commandList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    commandList_->IASetVertexBuffers(0, 1, &vertexBufferView_);
+    commandList_->IASetIndexBuffer(&indexBufferView_);
+    commandList_->DrawIndexedInstanced(6, 1, 0, 0, 0);
+    commandList_->DrawIndexedInstanced(6, 1, 0, 4, 0);
+
+    commandList_->ResourceBarrier(1, &renderTargetToPresent);
+
+    result = commandList_->Close();
+    if (FAILED(result))
+        errorCallback_();
+}
+
+static void waitForPreviousFrame(bool isShutdown)
+{
+    HRESULT result;
+
+    if (!isShutdown)
+        frameIdx_ = swapChain_->GetCurrentBackBufferIndex();
+
+    if (fences_[frameIdx_]->GetCompletedValue() < fenceValues_[frameIdx_]) {
+        result = fences_[frameIdx_]->SetEventOnCompletion(fenceValues_[frameIdx_], fenceEvent_);
+        if (FAILED(result))
+            errorCallback_();
+
+        WaitForSingleObject(fenceEvent_, INFINITE);
+    }
+
+    fenceValues_[frameIdx_]++;
+}
+
+
+static bool createDxgiFactory()
+{
+    HRESULT result = CreateDXGIFactory1(IID_PPV_ARGS(dxgiFactory_.GetAddressOf()));
+    if (FAILED(result))
+        return false;
+
+    return true;
+}
+
+static bool createDevice()
+{
     ComPtr<IDXGIAdapter1> adapter;
+    HRESULT result;
     int adapterIdx = 0;
     bool adapterFound = false;
 
-    while (dxgiFactory->EnumAdapters1(adapterIdx, adapter.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND) {
+    while (dxgiFactory_->EnumAdapters1(adapterIdx, adapter.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND) {
         DXGI_ADAPTER_DESC1 desc;
         adapter->GetDesc1(&desc);
 
@@ -105,11 +291,11 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
     if (FAILED(result))
         return false;
 
-    D3D12_COMMAND_QUEUE_DESC commandQueueDesc = {};
-    result = device_->CreateCommandQueue(&commandQueueDesc, IID_PPV_ARGS(commandQueue_.GetAddressOf()));
-    if (FAILED(result))
-        return false;
+    return true;
+}
 
+static bool createSwapChain(HWND window, int width, int height, bool fullscreen)
+{
     DXGI_MODE_DESC backBufferDesc = {};
     backBufferDesc.Width = width;
     backBufferDesc.Height = height;
@@ -128,26 +314,47 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
     swapChainDesc.Windowed = !fullscreen;
 
     ComPtr<IDXGISwapChain> tmpSwapChain;
-    dxgiFactory->CreateSwapChain(commandQueue_.Get(), &swapChainDesc, tmpSwapChain.GetAddressOf());
+    dxgiFactory_->CreateSwapChain(commandQueue_.Get(), &swapChainDesc, tmpSwapChain.GetAddressOf());
 
-    result = tmpSwapChain.As(&swapChain_);
+    HRESULT result = tmpSwapChain.As(&swapChain_);
     if (FAILED(result))
         return false;
 
     frameIdx_ = swapChain_->GetCurrentBackBufferIndex();
 
+    return true;
+}
+
+static bool createCommandQueue()
+{
+    D3D12_COMMAND_QUEUE_DESC commandQueueDesc = {};
+    HRESULT result = device_->CreateCommandQueue(&commandQueueDesc, IID_PPV_ARGS(commandQueue_.GetAddressOf()));
+    if (FAILED(result))
+        return false;
+
+    return true;
+}
+
+static bool createRTVDescHeap()
+{
+    // create render target view (rtv) descriptor memory. This is basically a
+    // memory/buffer, that will hold handles to the backbuffers to which
+    // the GPU will write
     D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
     rtvHeapDesc.NumDescriptors = framebufferCount_;
     rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-    result = device_->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(rtvDescriptorHeap_.GetAddressOf()));
+    HRESULT result = device_->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(rtvDescriptorHeap_.GetAddressOf()));
     if (FAILED(result))
         return false;
 
     rtvHandleSize_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
-    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle { rtvDescriptorHeap_->GetCPUDescriptorHandleForHeapStart() };
+    // handle to the beginning of memory buffer (or descriptor heap in dx12 terms)
+    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle{ rtvDescriptorHeap_->GetCPUDescriptorHandleForHeapStart() };
 
+    // for each buffer in swap chain create render target view (a handle to
+    // backbuffer) in the buffer location described by rtvHandle
     for (int i = 0; i < framebufferCount_; ++i) {
         result = swapChain_->GetBuffer(i, IID_PPV_ARGS(renderTargets_[i].GetAddressOf()));
         if (FAILED(result))
@@ -158,16 +365,76 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
         rtvHandle.Offset(1, rtvHandleSize_);
     }
 
+    return true;
+}
+
+static bool createDSVDescHeap(int width, int height)
+{
+    D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = {};
+    dsvHeapDesc.NumDescriptors = framebufferCount_;
+    dsvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    dsvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    HRESULT result = device_->CreateDescriptorHeap(&dsvHeapDesc, IID_PPV_ARGS(dsvDescriptorHeap_.GetAddressOf()));
+    if (FAILED(result))
+        return false;
+    dsvDescriptorHeap_->SetName(L"DepthStencilDescriptorHeap");
+
+    dsHandleSize_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+
+    D3D12_DEPTH_STENCIL_VIEW_DESC depthStencilDesc = {};
+    depthStencilDesc.Format = DXGI_FORMAT_D32_FLOAT;
+    depthStencilDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    depthStencilDesc.Flags = D3D12_DSV_FLAG_NONE;
+
+    D3D12_CLEAR_VALUE depthClearValue = {};
+    depthClearValue.Format = DXGI_FORMAT_D32_FLOAT;
+    depthClearValue.DepthStencil.Depth = 1.0f;
+    depthClearValue.DepthStencil.Stencil = 0;
+
+    const auto dsvHeapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+    const auto dsvTexDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_D32_FLOAT, width, height, 1, 0, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    CD3DX12_CPU_DESCRIPTOR_HANDLE dsvHandle { dsvDescriptorHeap_->GetCPUDescriptorHandleForHeapStart() };
+
+    for (int i = 0; i < framebufferCount_; ++i) {
+        result = device_->CreateCommittedResource(
+            &dsvHeapProps,
+            D3D12_HEAP_FLAG_NONE,
+            &dsvTexDesc,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE,
+            &depthClearValue,
+            IID_PPV_ARGS(depthStencilBuffer_[i].GetAddressOf()));
+        if (FAILED(result))
+            return false;
+
+        device_->CreateDepthStencilView(depthStencilBuffer_[i].Get(), &depthStencilDesc, dsvHandle);
+        dsvHandle.Offset(1, dsHandleSize_);
+    }
+
+    return true;
+}
+
+static bool createCommandResources()
+{
+    HRESULT result;
+
+    // create command allocators - this is kind of a interface to the GPU
+    // memory which holds the commands to be executed by the GPU.
     for (int i = 0; i < framebufferCount_; ++i) {
         result = device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(commandAllocators_[i].GetAddressOf()));
         if (FAILED(result))
             return false;
     }
 
+    // CPU buffer which records GPU commands. The commands are then submitted
+    // to GPU memory through the use of commandAllocators_. There only needs to
+    // be a single command list (for single threaded apps), since the CPU memory
+    // can be everwritten as soon as we exequte commandList on command queue.
     result = device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocators_[0].Get(), nullptr, IID_PPV_ARGS(commandList_.GetAddressOf()));
     if (FAILED(result))
         return false;
 
+    // Create a fence that will be used by each commandAllocator to check if
+    // all the commands in allocator have already been finished or not yet
     for (int i = 0; i < framebufferCount_; ++i) {
         result = device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fences_[i].GetAddressOf()));
         if (FAILED(result))
@@ -175,19 +442,25 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
         fenceValues_[i] = 0;
     }
 
+    // CPU fence used to wait for command completion on GPU
     fenceEvent_ = CreateEvent(nullptr, FALSE, FALSE, nullptr);
     if (!fenceEvent_)
         return false;
 
+    return true;
+}
+
+static bool createRootSignature()
+{
     CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc;
     rootSigDesc.Init(0, nullptr, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
 
     ComPtr<ID3DBlob> rootSig;
     ComPtr<ID3DBlob> errorBlob;
-    result = D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1, &rootSig, errorBlob.GetAddressOf());
+    HRESULT result = D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1, &rootSig, errorBlob.GetAddressOf());
     if (FAILED(result)) {
         if (errorBlob) {
-            printf("%s\n", (char*)errorBlob->GetBufferPointer());
+            OutputDebugStringA((char*)errorBlob->GetBufferPointer());
         }
         return false;
     }
@@ -196,49 +469,45 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
     if (FAILED(result))
         return false;
 
-    ComPtr<ID3DBlob> vertexShader;
-    result = D3DCompileFromFile(
-        (wprojectRoot_ + std::wstring(L"/shaders/vertex.hlsl")).c_str(),
+    return true;
+}
+
+static bool compileShader(const std::wstring& name, const char* shaderType, ID3DBlob** outShaderBytecode)
+{
+    ComPtr<ID3DBlob> errorBlob;
+
+    HRESULT result = D3DCompileFromFile(
+        (wprojectRoot_ + std::wstring(L"/shaders/") + name).c_str(),
         nullptr,
         nullptr,
         "main",
-        "vs_5_0",
+        shaderType,
         D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION,
         0,
-        &vertexShader,
-        errorBlob.ReleaseAndGetAddressOf());
+        outShaderBytecode,
+        errorBlob.GetAddressOf());
+
     if (FAILED(result)) {
         if (errorBlob)
             OutputDebugStringA((char*)errorBlob->GetBufferPointer());
         return false;
     }
 
+    return true;
+}
+
+static bool createPSO(ID3DBlob* vertexShader, ID3DBlob* pixelShader)
+{
     D3D12_SHADER_BYTECODE vertexBytecode;
     vertexBytecode.pShaderBytecode = vertexShader->GetBufferPointer();
     vertexBytecode.BytecodeLength = vertexShader->GetBufferSize();
-
-    ComPtr<ID3DBlob> pixelShader;
-    result = D3DCompileFromFile(
-        (wprojectRoot_ + std::wstring(L"/shaders/pixel.hlsl")).c_str(),
-        nullptr,
-        nullptr,
-        "main",
-        "ps_5_0",
-        D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION,
-        0,
-        pixelShader.GetAddressOf(),
-        errorBlob.ReleaseAndGetAddressOf());
-    if (FAILED(result)) {
-        if (errorBlob)
-            OutputDebugStringA((char*)errorBlob->GetBufferPointer());
-        return false;
-    }
 
     D3D12_SHADER_BYTECODE pixelBytecode;
     pixelBytecode.pShaderBytecode = pixelShader->GetBufferPointer();
     pixelBytecode.BytecodeLength = pixelShader->GetBufferSize();
 
-    D3D12_INPUT_ELEMENT_DESC inputLayout[] =
+    // would be nice to have just one of these for all assets
+    static const D3D12_INPUT_ELEMENT_DESC inputLayout[] =
     {
         { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
         { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
@@ -246,6 +515,10 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
     D3D12_INPUT_LAYOUT_DESC layoutDesc = {};
     layoutDesc.NumElements = sizeof(inputLayout) / sizeof(inputLayout[0]);
     layoutDesc.pInputElementDescs = inputLayout;
+
+    // There should be only 1 sample desc structure, the same for pso and rt
+    DXGI_SAMPLE_DESC sampleDesc = {};
+    sampleDesc.Count = 1;
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
     psoDesc.InputLayout = layoutDesc;
@@ -262,20 +535,25 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
     psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
     psoDesc.NumRenderTargets = 1;
 
-    result = device_->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(pipelineState_.GetAddressOf()));
+    HRESULT result = device_->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(pipelineState_.GetAddressOf()));
     if (FAILED(result))
         return false;
 
-    Vertex vertices[] = {
-        { { -0.5f,  0.5f, 0.5f }, { 1.0f, 0.0f, 0.0f, 1.0f } },
-        { {  0.5f, -0.5f, 0.5f }, { 0.0f, 1.0f, 0.0f, 1.0f } },
-        { { -0.5f, -0.5f, 0.5f }, { 0.0f, 0.0f, 1.0f, 1.0f } },
-        { {  0.5f,  0.5f, 0.5f }, { 1.0f, 0.0f, 0.0f, 1.0f } },
+    return true;
+}
 
-        { { -0.75f,  0.75f,  0.7f }, { 0.0f, 1.0f, 0.0f, 1.0f } },
-        { { 0.0f,  0.0f, 0.7f } , { 0.0f, 1.0f, 0.0f, 1.0f } },
-        { { -0.75f,  0.0f, 0.7f } , { 0.0f, 1.0f, 0.0f, 1.0f } },
-        { { 0.0f,  0.75f,  0.7f } , { 0.0f, 1.0f, 0.0f, 1.0f } },
+static bool setupGeometry()
+{
+    Vertex vertices[] = {
+        { { -0.5f,  0.5f, 0.5f },{ 1.0f, 0.0f, 0.0f, 1.0f } },
+        { { 0.5f, -0.5f, 0.5f },{ 0.0f, 1.0f, 0.0f, 1.0f } },
+        { { -0.5f, -0.5f, 0.5f },{ 0.0f, 0.0f, 1.0f, 1.0f } },
+        { { 0.5f,  0.5f, 0.5f },{ 1.0f, 0.0f, 0.0f, 1.0f } },
+
+        { { -0.75f,  0.75f,  0.7f },{ 0.0f, 1.0f, 0.0f, 1.0f } },
+        { { 0.0f,  0.0f, 0.7f } ,{ 0.0f, 1.0f, 0.0f, 1.0f } },
+        { { -0.75f,  0.0f, 0.7f } ,{ 0.0f, 1.0f, 0.0f, 1.0f } },
+        { { 0.0f,  0.75f,  0.7f } ,{ 0.0f, 1.0f, 0.0f, 1.0f } },
     };
     uint32_t vertBufSize = sizeof(vertices);
 
@@ -286,9 +564,12 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
     uint32_t indexBufSize = sizeof(indices);
 
     const auto defaultHeapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
-    const auto vertBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(vertBufSize);
+    const auto uploadHeapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
 
-    result = device_->CreateCommittedResource(
+    const auto vertBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(vertBufSize);
+    const auto indexBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(indexBufSize);
+
+    HRESULT result = device_->CreateCommittedResource(
         &defaultHeapProps,
         D3D12_HEAP_FLAG_NONE,
         &vertBufferDesc,
@@ -298,8 +579,6 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
     if (FAILED(result))
         return false;
     vertexBuffer_->SetName(L"VertexBufferResource");
-
-    const auto uploadHeapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
 
     ComPtr<ID3D12Resource> vertBufferUploadRes;
     result = device_->CreateCommittedResource(
@@ -312,8 +591,6 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
     if (FAILED(result))
         return false;
     vertBufferUploadRes->SetName(L"VertexBufferUploadResource");
-
-    const auto indexBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(indexBufSize);
 
     result = device_->CreateCommittedResource(
         &defaultHeapProps,
@@ -374,161 +651,5 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
     indexBufferView_.SizeInBytes = indexBufSize;
     indexBufferView_.Format = DXGI_FORMAT_R32_UINT;
 
-    viewport_.TopLeftX = 0;
-    viewport_.TopLeftY = 0;
-    viewport_.Width = (float)width;
-    viewport_.Height = (float)height;
-    viewport_.MinDepth = 0.0f;
-    viewport_.MaxDepth = 1.0f;
-
-    scissors_.top = 0;
-    scissors_.left = 0;
-    scissors_.bottom = height;
-    scissors_.right = width;
-
-    D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = {};
-    dsvHeapDesc.NumDescriptors = framebufferCount_;
-    dsvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-    dsvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-    result = device_->CreateDescriptorHeap(&dsvHeapDesc, IID_PPV_ARGS(dsvDescriptorHeap_.GetAddressOf()));
-    if (FAILED(result))
-        return false;
-    dsvDescriptorHeap_->SetName(L"DepthStencilDescriptorHeap");
-
-    dsHandleSize_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-
-    D3D12_DEPTH_STENCIL_VIEW_DESC depthStencilDesc = {};
-    depthStencilDesc.Format = DXGI_FORMAT_D32_FLOAT;
-    depthStencilDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
-    depthStencilDesc.Flags = D3D12_DSV_FLAG_NONE;
-
-    D3D12_CLEAR_VALUE depthClearValue = {};
-    depthClearValue.Format = DXGI_FORMAT_D32_FLOAT;
-    depthClearValue.DepthStencil.Depth = 1.0f;
-    depthClearValue.DepthStencil.Stencil = 0;
-
-    const auto dsvHeapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
-    const auto dsvTexDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_D32_FLOAT, width, height, 1, 0, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
-    CD3DX12_CPU_DESCRIPTOR_HANDLE dsvHandle { dsvDescriptorHeap_->GetCPUDescriptorHandleForHeapStart() };
-
-    for (int i = 0; i < framebufferCount_; ++i) {
-        result = device_->CreateCommittedResource(
-            &dsvHeapProps,
-            D3D12_HEAP_FLAG_NONE,
-            &dsvTexDesc,
-            D3D12_RESOURCE_STATE_DEPTH_WRITE,
-            &depthClearValue,
-            IID_PPV_ARGS(depthStencilBuffer_[i].GetAddressOf()));
-        if (FAILED(result))
-            return false;
-
-        device_->CreateDepthStencilView(depthStencilBuffer_[i].Get(), &depthStencilDesc, dsvHandle);
-        dsvHandle.Offset(1, dsHandleSize_);
-    }
-
     return true;
-}
-
-void update()
-{
-
-}
-
-void render()
-{
-    HRESULT result;
-
-    updatePipeline();
-
-    ID3D12CommandList* commandLists[] = { commandList_.Get() };
-
-    commandQueue_->ExecuteCommandLists(1, commandLists);
-
-    result = commandQueue_->Signal(fences_[frameIdx_].Get(), fenceValues_[frameIdx_]);
-    if (FAILED(result))
-        errorCallback_();
-
-    result = swapChain_->Present(0, 0);
-    if (FAILED(result))
-        errorCallback_();
-}
-
-void cleanupd3d()
-{
-    for (int i = 0; i < framebufferCount_; ++i) {
-        frameIdx_ = i;
-        waitForPreviousFrame(true);
-    }
-
-    BOOL fullscreen = false;
-    HRESULT result = swapChain_->GetFullscreenState(&fullscreen, NULL);
-    if (FAILED(result))
-        errorCallback_();
-
-    if (fullscreen)
-        swapChain_->SetFullscreenState(false, NULL);
-
-    CloseHandle(fenceEvent_);
-}
-
-void updatePipeline()
-{
-    HRESULT result;
-
-    waitForPreviousFrame();
-
-    result = commandAllocators_[frameIdx_]->Reset();
-    if (FAILED(result))
-        errorCallback_();
-
-    result = commandList_->Reset(commandAllocators_[frameIdx_].Get(), pipelineState_.Get());
-    if (FAILED(result))
-        errorCallback_();
-
-    const auto presentToRenderTarget = CD3DX12_RESOURCE_BARRIER::Transition(renderTargets_[frameIdx_].Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    const auto renderTargetToPresent = CD3DX12_RESOURCE_BARRIER::Transition(renderTargets_[frameIdx_].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
-
-    commandList_->ResourceBarrier(1, &presentToRenderTarget);
-
-    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle{ rtvDescriptorHeap_->GetCPUDescriptorHandleForHeapStart(), frameIdx_, rtvHandleSize_ };
-    CD3DX12_CPU_DESCRIPTOR_HANDLE dsvHandle{ dsvDescriptorHeap_->GetCPUDescriptorHandleForHeapStart(), frameIdx_, dsHandleSize_ };
-
-    commandList_->OMSetRenderTargets(1, &rtvHandle, false, &dsvHandle);
-
-    const float clearColor[] = { 0.0f, 0.2f, 0.4f, 1.0f };
-    commandList_->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
-    commandList_->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-
-    commandList_->SetGraphicsRootSignature(rootSignature_.Get());
-    commandList_->RSSetViewports(1, &viewport_);
-    commandList_->RSSetScissorRects(1, &scissors_);
-    commandList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    commandList_->IASetVertexBuffers(0, 1, &vertexBufferView_);
-    commandList_->IASetIndexBuffer(&indexBufferView_);
-    commandList_->DrawIndexedInstanced(6, 1, 0, 0, 0);
-    commandList_->DrawIndexedInstanced(6, 1, 0, 4, 0);
-
-    commandList_->ResourceBarrier(1, &renderTargetToPresent);
-
-    result = commandList_->Close();
-    if (FAILED(result))
-        errorCallback_();
-}
-
-void waitForPreviousFrame(bool isShutdown)
-{
-    HRESULT result;
-
-    if (!isShutdown)
-        frameIdx_ = swapChain_->GetCurrentBackBufferIndex();
-
-    if (fences_[frameIdx_]->GetCompletedValue() < fenceValues_[frameIdx_]) {
-        result = fences_[frameIdx_]->SetEventOnCompletion(fenceValues_[frameIdx_], fenceEvent_);
-        if (FAILED(result))
-            errorCallback_();
-
-        WaitForSingleObject(fenceEvent_, INFINITE);
-    }
-
-    fenceValues_[frameIdx_]++;
 }
