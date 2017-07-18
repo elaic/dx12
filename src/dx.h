@@ -1,7 +1,11 @@
 #if !defined(DX_H)
 #define DX_H
 
+#define NOMINMAX
+
 #include <windows.h>
+
+#undef NOMINMAX
 
 typedef void (*OnErrorCallback)();
 

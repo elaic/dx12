@@ -1,6 +1,7 @@
 #include "dx.h"
 
 #include "config.h"
+#include "image.h"
 
 #pragma warning(push)
 #pragma warning(disable : 4324)
@@ -21,7 +22,7 @@
 struct Vertex
 {
     DirectX::XMFLOAT3 pos;
-    DirectX::XMFLOAT4 color;
+    DirectX::XMFLOAT2 uv;
 
     static const D3D12_INPUT_ELEMENT_DESC inputLayout[];
     static const size_t inputLayoutSize;
@@ -30,7 +31,7 @@ struct Vertex
 const D3D12_INPUT_ELEMENT_DESC Vertex::inputLayout[] =
 {
     { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-    { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+    { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
 };
 
 const size_t Vertex::inputLayoutSize = sizeof(Vertex::inputLayout) / sizeof(Vertex::inputLayout[0]);
@@ -88,6 +89,10 @@ uint32_t dsHandleSize_;
 ComPtr<ID3D12Resource> constBuffers_[framebufferCount_];
 ConstantBuffer cbuf_;
 
+// Texture variables
+ComPtr<ID3D12Resource> textureBuffer_;
+ComPtr<ID3D12DescriptorHeap> mainDescriptorHeap_;
+
 // matrices
 DirectX::XMFLOAT4X4 cameraProjMat;
 DirectX::XMFLOAT4X4 cameraViewMat;
@@ -125,10 +130,11 @@ static bool createRTVDescHeap();
 static bool createDSVDescHeap(int width, int height);
 static bool createCommandResources();
 static bool createRootSignature();
-static bool createMainDescHeap();
+static bool createConstBuffers();
 static bool compileShader(const std::wstring& name, const char* shaderType, ID3DBlob** outShaderBytecode);
 static bool createPSO(ID3DBlob* vertexShader, ID3DBlob* pixelShader);
 static bool setupGeometry();
+static bool setupTexture();
 
 bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallback errorCallback)
 {
@@ -154,7 +160,7 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
     if (!createDSVDescHeap(width, height))
         return false;
 
-    if (!createMainDescHeap())
+    if (!createConstBuffers())
         return false;
 
     if (!createCommandResources())
@@ -175,6 +181,9 @@ bool initd3d(HWND window, int width, int height, bool fullscreen, OnErrorCallbac
         return false;
 
     if (!setupGeometry())
+        return false;
+
+    if (!setupTexture())
         return false;
 
     viewport_.TopLeftX = 0;
@@ -380,8 +389,12 @@ static void updatePipeline()
     commandList_->IASetVertexBuffers(0, 1, &vertexBufferView_);
     commandList_->IASetIndexBuffer(&indexBufferView_);
 
+    ID3D12DescriptorHeap* descriptorHeaps[] = { mainDescriptorHeap_.Get() };
+
     commandList_->SetGraphicsRootSignature(rootSignature_.Get());
+    commandList_->SetDescriptorHeaps(sizeof(descriptorHeaps) / sizeof(descriptorHeaps[0]), descriptorHeaps);
     commandList_->SetGraphicsRootConstantBufferView(0, constBuffers_[frameIdx_]->GetGPUVirtualAddress());
+    commandList_->SetGraphicsRootDescriptorTable(1, mainDescriptorHeap_->GetGPUDescriptorHandleForHeapStart());
 
     commandList_->DrawIndexedInstanced(numCubeIndices_, 1, 0, 0, 0);
 
@@ -581,7 +594,7 @@ static bool createDSVDescHeap(int width, int height)
     return true;
 }
 
-static bool createMainDescHeap()
+static bool createConstBuffers()
 {
     HRESULT result;
 
@@ -641,6 +654,7 @@ static bool createCommandResources()
     result = device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocators_[0].Get(), nullptr, IID_PPV_ARGS(commandList_.GetAddressOf()));
     if (FAILED(result))
         return false;
+    commandList_->Close();
 
     // Create a fence that will be used by each commandAllocator to check if
     // all the commands in allocator have already been finished or not yet
@@ -665,22 +679,51 @@ static bool createRootSignature()
     rootCBVDesc.RegisterSpace = 0;
     rootCBVDesc.ShaderRegister = 0;
 
-    D3D12_ROOT_PARAMETER rootParams[1] = {};
+    D3D12_DESCRIPTOR_RANGE srvRanges[1] = {};
+    srvRanges[0].BaseShaderRegister = 0;
+    srvRanges[0].NumDescriptors = 1;
+    srvRanges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    srvRanges[0].RegisterSpace = 0;
+    srvRanges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_ROOT_DESCRIPTOR_TABLE rootSRVDescTable;
+    rootSRVDescTable.NumDescriptorRanges = sizeof(srvRanges) / sizeof(srvRanges[0]);
+    rootSRVDescTable.pDescriptorRanges = srvRanges;
+
+    D3D12_ROOT_PARAMETER rootParams[2] = {};
     rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     rootParams[0].Descriptor = rootCBVDesc;
     rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+
+    rootParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rootParams[1].DescriptorTable = rootSRVDescTable;
+    rootParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_STATIC_SAMPLER_DESC samplerDescs[1] = {};
+    samplerDescs[0].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    samplerDescs[0].AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    samplerDescs[0].AddressV = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    samplerDescs[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    samplerDescs[0].MipLODBias = 0;
+    samplerDescs[0].MaxAnisotropy = 0;
+    samplerDescs[0].ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    samplerDescs[0].BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+    samplerDescs[0].MinLOD = 0.0f;
+    samplerDescs[0].MaxLOD = std::numeric_limits<float>::max();
+    samplerDescs[0].ShaderRegister = 0;
+    samplerDescs[0].RegisterSpace = 0;
+    samplerDescs[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc;
     rootSigDesc.Init(
         sizeof(rootParams) / sizeof(rootParams[0]),
         rootParams,
-        0,
-        nullptr,
+        sizeof(samplerDescs) / sizeof(samplerDescs[0]),
+        samplerDescs,
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
         D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
         D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
-        D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS |
-        D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS);
+        D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS);
 
     ComPtr<ID3DBlob> rootSig;
     ComPtr<ID3DBlob> errorBlob;
@@ -768,40 +811,40 @@ static bool setupGeometry()
 {
     Vertex vertices[] = {
         // front face
-        { { -0.5f,  0.5f, -0.5f }, { 1.0f, 0.0f, 0.0f, 1.0f } },
-        { { 0.5f, -0.5f, -0.5f }, { 1.0f, 0.0f, 1.0f, 1.0f } },
-        { { -0.5f, -0.5f, -0.5f }, { 0.0f, 0.0f, 1.0f, 1.0f } },
-        { { 0.5f,  0.5f, -0.5f }, { 0.0f, 1.0f, 0.0f, 1.0f } },
+        { { -0.5f,  0.5f, -0.5f }, { 0.0f, 0.0f } },
+        { { 0.5f, -0.5f, -0.5f }, { 1.0f, 1.0f } },
+        { { -0.5f, -0.5f, -0.5f }, { 0.0f, 1.0f } },
+        { { 0.5f,  0.5f, -0.5f }, { 1.0f, 0.0f } },
 
         // right side face
-        { { 0.5f, -0.5f, -0.5f }, { 1.0f, 0.0f, 0.0f, 1.0f } },
-        { { 0.5f,  0.5f,  0.5f }, { 1.0f, 0.0f, 1.0f, 1.0f } },
-        { { 0.5f, -0.5f,  0.5f }, { 0.0f, 0.0f, 1.0f, 1.0f } },
-        { { 0.5f,  0.5f, -0.5f }, { 0.0f, 1.0f, 0.0f, 1.0f } },
+        { { 0.5f, -0.5f, -0.5f }, { 0.0f, 1.0f } },
+        { { 0.5f,  0.5f,  0.5f }, { 1.0f, 0.0f } },
+        { { 0.5f, -0.5f,  0.5f }, { 1.0f, 1.0f } },
+        { { 0.5f,  0.5f, -0.5f }, { 0.0f, 0.0f } },
 
         // left side face
-        { { -0.5f,  0.5f,  0.5f }, { 1.0f, 0.0f, 0.0f, 1.0f } },
-        { { -0.5f, -0.5f, -0.5f }, { 1.0f, 0.0f, 1.0f, 1.0f } },
-        { { -0.5f, -0.5f,  0.5f }, { 0.0f, 0.0f, 1.0f, 1.0f } },
-        { { -0.5f,  0.5f, -0.5f }, { 0.0f, 1.0f, 0.0f, 1.0f } },
+        { { -0.5f,  0.5f,  0.5f }, { 0.0f, 0.0f } },
+        { { -0.5f, -0.5f, -0.5f }, { 1.0f, 1.0f } },
+        { { -0.5f, -0.5f,  0.5f }, { 0.0f, 1.0f } },
+        { { -0.5f,  0.5f, -0.5f }, { 1.0f, 0.0f } },
 
         // back face
-        { { 0.5f,  0.5f,  0.5f }, { 1.0f, 0.0f, 0.0f, 1.0f } },
-        { { -0.5f, -0.5f,  0.5f }, { 1.0f, 0.0f, 1.0f, 1.0f } },
-        { { 0.5f, -0.5f,  0.5f }, { 0.0f, 0.0f, 1.0f, 1.0f } },
-        { { -0.5f,  0.5f,  0.5f }, { 0.0f, 1.0f, 0.0f, 1.0f } },
+        { { 0.5f,  0.5f,  0.5f }, { 0.0f, 0.0f, } },
+        { { -0.5f, -0.5f,  0.5f }, { 1.0f, 1.0f } },
+        { { 0.5f, -0.5f,  0.5f }, { 0.0f, 1.0f } },
+        { { -0.5f,  0.5f,  0.5f }, { 1.0f, 0.0f } },
 
         // top face
-        { { -0.5f,  0.5f, -0.5f }, { 1.0f, 0.0f, 0.0f, 1.0f } },
-        { { 0.5f,  0.5f,  0.5f }, { 1.0f, 0.0f, 1.0f, 1.0f } },
-        { { 0.5f,  0.5f, -0.5f }, { 0.0f, 0.0f, 1.0f, 1.0f } },
-        { { -0.5f,  0.5f,  0.5f }, { 0.0f, 1.0f, 0.0f, 1.0f } },
+        { { -0.5f,  0.5f, -0.5f }, { 0.0f, 1.0f } },
+        { { 0.5f,  0.5f,  0.5f }, { 1.0f, 0.0f } },
+        { { 0.5f,  0.5f, -0.5f }, { 1.0f, 1.0f } },
+        { { -0.5f,  0.5f,  0.5f }, { 0.0f, 0.0f } },
 
         // bottom face
-        { { 0.5f, -0.5f,  0.5f }, { 1.0f, 0.0f, 0.0f, 1.0f } },
-        { { -0.5f, -0.5f, -0.5f }, { 1.0f, 0.0f, 1.0f, 1.0f } },
-        { { 0.5f, -0.5f, -0.5f }, { 0.0f, 0.0f, 1.0f, 1.0f } },
-        { { -0.5f, -0.5f,  0.5f }, { 0.0f, 1.0f, 0.0f, 1.0f } },
+        { { 0.5f, -0.5f,  0.5f }, { 0.0f, 0.0f } },
+        { { -0.5f, -0.5f, -0.5f }, { 1.0f, 1.0f } },
+        { { 0.5f, -0.5f, -0.5f }, { 0.0f, 1.0f } },
+        { { -0.5f, -0.5f,  0.5f }, { 1.0f, 0.0f } },
     };
     uint32_t vertBufSize = sizeof(vertices);
 
@@ -898,10 +941,14 @@ static bool setupGeometry()
     const auto vertexTransition = CD3DX12_RESOURCE_BARRIER::Transition(vertexBuffer_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
     const auto indexTransition = CD3DX12_RESOURCE_BARRIER::Transition(indexBuffer_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
 
+    commandAllocators_[frameIdx_]->Reset();
+    commandList_->Reset(commandAllocators_[frameIdx_].Get(), nullptr);
+
     UpdateSubresources(commandList_.Get(), vertexBuffer_.Get(), vertBufferUploadRes.Get(), 0, 0, 1, &vertexData);
     commandList_->ResourceBarrier(1, &vertexTransition);
     UpdateSubresources(commandList_.Get(), indexBuffer_.Get(), indexBufferUploadRes.Get(), 0, 0, 1, &indexData);
     commandList_->ResourceBarrier(1, &indexTransition);
+
     commandList_->Close();
     ID3D12CommandList* cmdLists[] = { commandList_.Get() };
     commandQueue_->ExecuteCommandLists(1, cmdLists);
@@ -909,9 +956,6 @@ static bool setupGeometry()
     result = commandQueue_->Signal(fences_[frameIdx_].Get(), fenceValues_[frameIdx_]);
     if (FAILED(result))
         return false;
-    waitForPreviousFrame();
-    // TODO: super ugly hack!!! Rework wait for previous frame!
-    fenceValues_[frameIdx_]--;
 
     vertexBufferView_.BufferLocation = vertexBuffer_->GetGPUVirtualAddress();
     vertexBufferView_.SizeInBytes = vertBufSize;
@@ -920,6 +964,105 @@ static bool setupGeometry()
     indexBufferView_.BufferLocation = indexBuffer_->GetGPUVirtualAddress();
     indexBufferView_.SizeInBytes = indexBufSize;
     indexBufferView_.Format = DXGI_FORMAT_R32_UINT;
+
+    waitForPreviousFrame();
+    // TODO: super ugly hack!!! Rework wait for previous frame!
+    fenceValues_[frameIdx_]--;
+
+    return true;
+}
+
+static bool setupTexture()
+{
+    D3D12_RESOURCE_DESC textureDesc;
+    std::vector<BYTE> imageData;
+    int imageBytesPerRow;
+
+    std::wstring texFile = wprojectRoot_ + std::wstring(L"/textures/") + std::wstring(L"test-texture.png");
+
+    int imageSize = LoadImageDataFromFile(imageData, textureDesc, texFile.c_str(), imageBytesPerRow);
+
+    if (imageSize <= 0)
+        return false;
+
+    HRESULT result;
+
+    const auto defaultHeapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+    const auto uploadHeapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+
+    result = device_->CreateCommittedResource(
+        &defaultHeapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &textureDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr,
+        IID_PPV_ARGS(textureBuffer_.GetAddressOf()));
+
+    if (FAILED(result))
+        return false;
+
+    textureBuffer_->SetName(L"TextureBufferResourceHeap");
+
+    uint64_t texUploadBufferSize;
+    device_->GetCopyableFootprints(&textureDesc, 0, 1, 0, nullptr, nullptr, nullptr, &texUploadBufferSize);
+
+    const auto uploadDesc = CD3DX12_RESOURCE_DESC::Buffer(texUploadBufferSize);
+
+    ComPtr<ID3D12Resource> texUploadBuffer;
+    result = device_->CreateCommittedResource(
+        &uploadHeapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &uploadDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(texUploadBuffer.GetAddressOf()));
+
+    if (FAILED(result))
+        return false;
+
+    texUploadBuffer->SetName(L"TextureUploadBufferResource");
+
+    D3D12_SUBRESOURCE_DATA texUploadDesc = {};
+    texUploadDesc.pData = &imageData[0];
+    texUploadDesc.RowPitch = imageBytesPerRow;
+    texUploadDesc.SlicePitch = imageBytesPerRow * textureDesc.Height;
+
+    const auto texTransition = CD3DX12_RESOURCE_BARRIER::Transition(textureBuffer_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    commandAllocators_[frameIdx_]->Reset();
+    commandList_->Reset(commandAllocators_[frameIdx_].Get(), nullptr);
+
+    UpdateSubresources(commandList_.Get(), textureBuffer_.Get(), texUploadBuffer.Get(), 0, 0, 1, &texUploadDesc);
+    commandList_->ResourceBarrier(1, &texTransition);
+
+    commandList_->Close();
+    ID3D12CommandList* cmdLists[] = { commandList_.Get() };
+    commandQueue_->ExecuteCommandLists(1, cmdLists);
+
+    result = commandQueue_->Signal(fences_[frameIdx_].Get(), fenceValues_[frameIdx_]);
+    if (FAILED(result))
+        return false;
+
+    D3D12_DESCRIPTOR_HEAP_DESC  heapDesc = {};
+    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heapDesc.NumDescriptors = 1;
+    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    
+    result = device_->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(mainDescriptorHeap_.GetAddressOf()));
+    if (FAILED(result))
+        return false;
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.Format = textureDesc.Format;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MipLevels = 1;
+
+    device_->CreateShaderResourceView(textureBuffer_.Get(), &srvDesc, mainDescriptorHeap_->GetCPUDescriptorHandleForHeapStart());
+
+    waitForPreviousFrame();
+    // TODO: super ugly hack!!! Rework wait for previous frame!
+    fenceValues_[frameIdx_]--;
 
     return true;
 }

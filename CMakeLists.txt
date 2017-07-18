@@ -28,6 +28,8 @@ set(MAIN_SRCS
 	${MAIN_DIR}/d3dx12.h
 	${MAIN_DIR}/dx.h
 	${MAIN_DIR}/dx.cpp
+	${MAIN_DIR}/image.h
+	${MAIN_DIR}/image.cpp
 	${MAIN_DIR}/main.cpp
 )
 
